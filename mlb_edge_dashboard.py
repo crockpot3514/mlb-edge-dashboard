@@ -20,6 +20,7 @@ touch Real's app, and does not automate anything on your behalf. You still
 manually check Real's percentages and manually place any bets yourself.
 """
 
+import os
 import threading
 import time
 from datetime import datetime, timezone
@@ -38,6 +39,7 @@ _state = {
     "games": [],
     "last_updated": None,
     "error": None,
+    "debug": {},
 }
 
 
@@ -45,12 +47,19 @@ def fetch_kalshi_mlb_games():
     """Pull open KXMLBGAME markets and normalize into a simple list."""
     url = f"{KALSHI_BASE}/markets"
     params = {"series_ticker": SERIES_TICKER, "status": "open", "limit": 200}
-    resp = requests.get(url, params=params, timeout=15)
+    resp = requests.get(url, params=params, timeout=15, headers={"User-Agent": "mlb-edge-dashboard/1.0"})
     resp.raise_for_status()
     data = resp.json()
 
+    raw_markets = data.get("markets", [])
+    debug = {
+        "requested_url": resp.url,
+        "raw_market_count": len(raw_markets),
+        "sample_tickers": [m.get("ticker") for m in raw_markets[:5]],
+    }
+
     games = []
-    for m in data.get("markets", []):
+    for m in raw_markets:
         # Skip non-standard / multivariate combo markets, which have a
         # different ticker format and aren't single-game moneylines.
         ticker = m.get("ticker", "")
@@ -88,6 +97,8 @@ def fetch_kalshi_mlb_games():
             "volume": m.get("volume_fp"),
         })
 
+    debug["matched_after_filter"] = len(games)
+
     # Group both sides of the same game together by event_ticker so each
     # card shows one matchup instead of duplicate legs.
     grouped = {}
@@ -95,17 +106,18 @@ def fetch_kalshi_mlb_games():
         key = g["event_ticker"]
         if key not in grouped:
             grouped[key] = g
-    return list(grouped.values())
+    return list(grouped.values()), debug
 
 
 def poll_loop():
     while True:
         try:
-            games = fetch_kalshi_mlb_games()
+            games, debug = fetch_kalshi_mlb_games()
             with _lock:
                 _state["games"] = games
                 _state["last_updated"] = datetime.now(timezone.utc).isoformat()
                 _state["error"] = None
+                _state["debug"] = debug
         except Exception as e:
             with _lock:
                 _state["error"] = str(e)
@@ -120,6 +132,7 @@ def api_games():
             "last_updated": _state["last_updated"],
             "error": _state["error"],
             "poll_seconds": POLL_SECONDS,
+            "debug": _state["debug"],
         })
 
 
@@ -142,125 +155,3 @@ PAGE = """
   .edge { margin-top: 8px; font-size: 13px; font-weight: 600; padding: 4px 10px; border-radius: 6px; display: inline-block; }
   .edge-none { color: #888; }
   .edge-value { background: #e1f5ee; color: #085041; }
-  .edge-small { background: #faeeda; color: #633806; }
-  .status { font-size: 12px; color: #999; margin-bottom: 16px; }
-</style>
-</head>
-<body>
-<h1>MLB edge finder</h1>
-<div class="sub">Live Kalshi win probabilities. Enter Real's win % for each team to see the gap.</div>
-<div class="status" id="status">Loading...</div>
-<div id="games"></div>
-
-<script>
-const realInputs = {};
-
-function pct(x) { return x === null || x === undefined ? '—' : (x*100).toFixed(1) + '%'; }
-
-function render(data) {
-  const statusEl = document.getElementById('status');
-  if (data.error) {
-    statusEl.textContent = 'Error fetching Kalshi data: ' + data.error;
-  } else {
-    const t = data.last_updated ? new Date(data.last_updated).toLocaleTimeString() : '—';
-    statusEl.textContent = 'Last updated ' + t + ' · refreshes every ' + data.poll_seconds + 's · ' + data.games.length + ' games';
-  }
-
-  const container = document.getElementById('games');
-  container.innerHTML = '';
-
-  if (!data.games.length) {
-    container.innerHTML = '<p style="color:#888;">No open KXMLBGAME markets right now.</p>';
-    return;
-  }
-
-  data.games.forEach(g => {
-    const key = g.ticker;
-    if (!realInputs[key]) realInputs[key] = { yes: '', no: '' };
-
-    const card = document.createElement('div');
-    card.className = 'card';
-    card.innerHTML = `
-      <div class="row">
-        <div class="team">
-          <div class="team-name">${g.yes_team}</div>
-          <div class="market-prob">Kalshi: ${pct(g.yes_prob)}</div>
-        </div>
-        <input type="number" min="1" max="99" placeholder="Real %" data-key="${key}" data-side="yes" value="${realInputs[key].yes}" />
-      </div>
-      <div class="row" style="margin-top:8px;">
-        <div class="team">
-          <div class="team-name">${g.no_team}</div>
-          <div class="market-prob">Kalshi: ${pct(g.no_prob)}</div>
-        </div>
-        <input type="number" min="1" max="99" placeholder="Real %" data-key="${key}" data-side="no" value="${realInputs[key].no}" />
-      </div>
-      <div class="edge-slot" data-key="${key}"></div>
-    `;
-    container.appendChild(card);
-
-    card.querySelectorAll('input').forEach(inp => {
-      inp.addEventListener('input', (e) => {
-        const k = e.target.getAttribute('data-key');
-        const side = e.target.getAttribute('data-side');
-        realInputs[k][side] = e.target.value;
-        updateEdge(g, card);
-      });
-    });
-
-    updateEdge(g, card);
-  });
-}
-
-function updateEdge(g, card) {
-  const key = g.ticker;
-  const yesReal = realInputs[key].yes === '' ? null : Number(realInputs[key].yes) / 100;
-  const noReal = realInputs[key].no === '' ? null : Number(realInputs[key].no) / 100;
-  const slot = card.querySelector('.edge-slot');
-
-  if (yesReal === null && noReal === null) { slot.innerHTML = ''; return; }
-  if (g.yes_prob === null) { slot.innerHTML = '<span class="edge edge-none">No live Kalshi price yet</span>'; return; }
-
-  const edgeYes = yesReal !== null ? (g.yes_prob - yesReal) : null;
-  const edgeNo = noReal !== null ? (g.no_prob - noReal) : null;
-
-  let best = null;
-  if (edgeYes !== null && (!best || edgeYes > best.edge)) best = { team: g.yes_team, edge: edgeYes };
-  if (edgeNo !== null && (!best || edgeNo > best.edge)) best = { team: g.no_team, edge: edgeNo };
-
-  if (!best || best.edge <= 0) {
-    slot.innerHTML = '<span class="edge edge-none">No clear edge on Real at these numbers</span>';
-    return;
-  }
-  const cls = best.edge >= 0.05 ? 'edge-value' : 'edge-small';
-  slot.innerHTML = '<span class="edge ' + cls + '">Value on ' + best.team + ' — Kalshi ' + (best.edge*100).toFixed(1) + ' pts higher than Real</span>';
-}
-
-async function refresh() {
-  try {
-    const res = await fetch('/api/games');
-    const data = await res.json();
-    render(data);
-  } catch (e) {
-    document.getElementById('status').textContent = 'Could not reach local server: ' + e;
-  }
-}
-
-refresh();
-setInterval(refresh, 15000);
-</script>
-</body>
-</html>
-"""
-
-
-@app.route("/")
-def index():
-    return render_template_string(PAGE)
-
-
-if __name__ == "__main__":
-    t = threading.Thread(target=poll_loop, daemon=True)
-    t.start()
-    print("Starting MLB edge dashboard at http://127.0.0.1:5050")
-    app.run(host="127.0.0.1", port=5050, debug=False)
